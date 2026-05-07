@@ -17,7 +17,7 @@ use crate::logger::SharedExternalPrinterLogger;
 use async_channel::Sender;
 use boa_engine::JsValue;
 use boa_engine::error::JsErasedError;
-use boa_engine::job::{JobExecutor, NativeAsyncJob};
+use boa_engine::job::NativeAsyncJob;
 use boa_engine::{
     Context, JsError, Source,
     builtins::promise::PromiseState,
@@ -35,13 +35,11 @@ use color_eyre::{
 };
 use colored::Colorize;
 use debug::init_boa_debug_object;
-use futures_lite::future;
 use rustyline::{EditMode, Editor, config::Config, error::ReadlineError};
-use std::cell::RefCell;
 use std::time::{Duration, Instant};
 use std::{
     fs::OpenOptions,
-    io::{self, IsTerminal, Read},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     rc::Rc,
     thread,
@@ -155,6 +153,14 @@ struct Opt {
     #[arg(long)]
     debug_object: bool,
 
+    /// Inject the test262 host object `$262`.
+    #[arg(long)]
+    test262_object: bool,
+
+    /// Disallow the main thread from blocking (e.g. `Atomics.wait`).
+    #[arg(long)]
+    no_can_block: bool,
+
     /// Treats the input files as modules.
     #[arg(long, short = 'm', group = "mod")]
     module: bool,
@@ -167,6 +173,10 @@ struct Opt {
     /// executed prior to the expression.
     #[arg(long, short = 'e')]
     expression: Option<String>,
+
+    /// Suppress the welcome banner when starting the REPL.
+    #[arg(long, short = 'q')]
+    quiet: bool,
 }
 
 impl Opt {
@@ -283,13 +293,18 @@ impl Drop for Counters {
 ///
 /// Returns a error of type String with a error message,
 /// if the source has a syntax or parsing error.
-fn dump<R: ReadChar>(src: Source<'_, R>, args: &Opt, context: &mut Context) -> Result<()> {
+fn dump<R: ReadChar>(
+    src: Source<'_, R>,
+    args: &Opt,
+    is_module: bool,
+    context: &mut Context,
+) -> Result<()> {
     if let Some(arg) = args.dump_ast {
         let mut counters = Counters::new(args.time);
         let arg = arg.unwrap_or_default();
         let mut parser = boa_parser::Parser::new(src);
         let dump =
-            if args.module {
+            if is_module {
                 let scope = context.realm().scope().clone();
                 let module = {
                     let _timer = counters.new_timer("Parsing");
@@ -361,14 +376,18 @@ fn generate_flowgraph<R: ReadChar>(
 
 #[must_use]
 fn uncaught_error(error: &JsError) -> String {
-    format!("{}: {}\n", "Uncaught".red(), error.to_string().red())
+    format!(
+        "{} {}\n",
+        "Uncaught Error:".red().bold(),
+        error.to_string().red()
+    )
 }
 
 #[must_use]
 fn uncaught_job_error(error: &JsError) -> String {
     format!(
-        "{}: {}\n",
-        "Uncaught error (during job evaluation)".red(),
+        "{} {}\n",
+        "Uncaught Error (during job evaluation):".red().bold(),
         error.to_string().red()
     )
 }
@@ -380,7 +399,7 @@ fn evaluate_expr(
     printer: &SharedExternalPrinterLogger,
 ) -> Result<()> {
     if args.has_dump_flag() {
-        dump(Source::from_bytes(line), args, context)?;
+        dump(Source::from_bytes(line), args, args.module, context)?;
     } else if let Some(flowgraph) = args.flowgraph {
         match generate_flowgraph(
             context,
@@ -427,8 +446,11 @@ fn evaluate_file(
     loader: &SimpleModuleLoader,
     printer: &SharedExternalPrinterLogger,
 ) -> Result<()> {
+    // Treat files with .mjs extension automatically as modules.
+    let is_module = args.module || file.extension().is_some_and(|ext| ext == "mjs");
+
     if args.has_dump_flag() {
-        return dump(Source::from_filepath(file)?, args, context);
+        return dump(Source::from_filepath(file)?, args, is_module, context);
     }
 
     if let Some(flowgraph) = args.flowgraph {
@@ -444,7 +466,7 @@ fn evaluate_file(
         return Ok(());
     }
 
-    if args.module {
+    if is_module {
         let source = Source::from_filepath(file)?;
         let mut counters = Counters::new(args.time);
         let module = {
@@ -515,11 +537,16 @@ fn evaluate_files(
     Ok(())
 }
 
+#[expect(clippy::too_many_lines)]
 fn main() -> Result<()> {
     color_eyre::config::HookBuilder::default()
         .display_location_section(false)
         .display_env_section(false)
         .install()?;
+
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| eyre!("could not install ring as the default crypto provider"))?;
 
     #[cfg(feature = "dhat")]
     let _profiler = dhat::Profiler::new_heap();
@@ -535,6 +562,7 @@ fn main() -> Result<()> {
     let context = &mut ContextBuilder::new()
         .job_executor(executor.clone())
         .module_loader(loader.clone())
+        .can_block(!args.no_can_block)
         .build()
         .map_err(|e| eyre!(e.to_string()))?;
 
@@ -549,6 +577,20 @@ fn main() -> Result<()> {
 
     if args.debug_object {
         init_boa_debug_object(context);
+    }
+
+    if args.test262_object {
+        boa_runtime::test262::register_js262(
+            boa_runtime::test262::WorkerHandles::new(),
+            true, // register `console` in $262.agent worker threads
+            context,
+        );
+
+        // Add print() that test262 uses to report errors and async success.
+        // boa_tester handles it internally, but CLI should just print messages.
+        context
+            .eval(Source::from_bytes("var print = console.log.bind(console);"))
+            .expect("failed to define print");
     }
 
     // Configure optimizer options
@@ -580,12 +622,46 @@ fn main() -> Result<()> {
         };
     }
 
-    let handle = start_readline_thread(sender, printer.clone(), args.vi_mode);
+    // Print the welcome banner unless --quiet is passed.
+    if !args.quiet {
+        let version = env!("CARGO_PKG_VERSION");
+        println!("{}", format!("Welcome to Boa v{version}").bold());
+        println!(
+            "Type {} for more information, {} to exit.",
+            "\".help\"".green(),
+            "Ctrl+D".green()
+        );
+        println!();
+    }
 
+    let handle = start_readline_thread(sender, printer.clone(), args.vi_mode, args.strict);
+
+    // TODO: Replace the `__BOA_LOAD_FILE__` string sentinel with a `CliCommand` enum
+    // (e.g. `Exec(String)` / `LoadFile(PathBuf)`) for type-safe cross-thread communication.
     let exec = executor.clone();
     let eval_loop = NativeAsyncJob::new(async move |context| {
         while let Ok(line) = receiver.recv().await {
             let printer_clone = printer.clone();
+
+            if let Some(file_path) = line.strip_prefix("__BOA_LOAD_FILE__:") {
+                let path = Path::new(file_path);
+                if path.exists() {
+                    let mut context = context.borrow_mut();
+                    if let Err(e) =
+                        evaluate_file(path, &args, &mut context, &loader, &printer_clone)
+                    {
+                        printer_clone.print(format!("{e}\n"));
+                    }
+                } else {
+                    printer_clone.print(format!(
+                        "{} file '{}' not found\n",
+                        "Error:".red().bold(),
+                        file_path
+                    ));
+                }
+                continue;
+            }
+
             // schedule a new evaluation job that can run asynchronously
             // with the other evaluations.
             let eval_script = NativeAsyncJob::new(async move |context| {
@@ -619,13 +695,12 @@ fn main() -> Result<()> {
         }
         // channel was closed, so clear the executor queue to abort all
         // pending jobs and exit.
-        exec.clear();
+        exec.stop();
         Ok(JsValue::undefined())
     });
     context.enqueue_job(eval_loop.into());
 
-    let result = future::block_on(executor.run_jobs_async(&RefCell::new(context)))
-        .map_err(|e| e.into_erased(context));
+    let result = context.run_jobs().map_err(|e| e.into_erased(context));
 
     handle.join().expect("failed to join thread");
 
@@ -636,6 +711,7 @@ fn readline_thread_main(
     sender: &Sender<String>,
     printer_out: &SharedExternalPrinterLogger,
     vi_mode: bool,
+    strict: bool,
 ) -> Result<()> {
     let config = Config::builder()
         .keyseq_timeout(Some(1))
@@ -663,17 +739,48 @@ fn readline_thread_main(
         .load_history(CLI_HISTORY)
         .wrap_err("failed to read history file `.boa_history`")?;
     let readline = ">> ";
-    editor.set_helper(Some(helper::RLHelper::new(readline)));
+    editor.set_helper(Some(helper::RLHelper::new(readline, strict)));
 
     loop {
-        match editor.readline(readline) {
+        match editor.readline(readline).map(|l| l.trim().to_string()) {
             Ok(line) if line == ".exit" => break,
-            Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
+            Err(ReadlineError::Eof) => break,
+            Err(ReadlineError::Interrupted) => {
+                println!("(To exit, press Ctrl+D or type .exit)");
+            }
+
+            Ok(ref line) if line == ".help" => {
+                println!("REPL Commands:");
+                println!("  {}       Show this help message", ".help".green());
+                println!("  {}       Exit the REPL", ".exit".green());
+                println!("  {}      Clear the terminal screen", ".clear".green());
+                println!(
+                    "  {} Load and evaluate a JavaScript file",
+                    ".load <file>".green()
+                );
+                println!();
+                println!("Press {} to abort the current expression.", "Ctrl+C".bold());
+                println!("Press {} to exit the REPL.", "Ctrl+D".bold());
+            }
+
+            Ok(ref line) if line == ".clear" => {
+                print!("\x1B[2J\x1B[3J\x1B[1;1H");
+                io::stdout().flush().ok();
+            }
+
+            Ok(ref line) if line == ".load" || line.starts_with(".load ") => {
+                let file = line.strip_prefix(".load").unwrap_or("").trim();
+                if file.is_empty() {
+                    eprintln!("{}", "Usage: .load <filename>".yellow());
+                } else {
+                    sender.send_blocking(format!("__BOA_LOAD_FILE__:{file}"))?;
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
 
             Ok(line) => {
-                let line = line.trim_end();
-                editor.add_history_entry(line).map_err(io::Error::other)?;
-                sender.send_blocking(line.to_string())?;
+                editor.add_history_entry(&line).map_err(io::Error::other)?;
+                sender.send_blocking(line)?;
                 thread::sleep(Duration::from_millis(10));
             }
 
@@ -699,9 +806,10 @@ fn start_readline_thread(
     sender: Sender<String>,
     printer_out: SharedExternalPrinterLogger,
     vi_mode: bool,
+    strict: bool,
 ) -> thread::JoinHandle<()> {
     thread::spawn(
-        move || match readline_thread_main(&sender, &printer_out, vi_mode) {
+        move || match readline_thread_main(&sender, &printer_out, vi_mode, strict) {
             Ok(()) => {}
             Err(e) => eprintln!("readline thread failed: {e}"),
         },
